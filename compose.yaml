@@ -1,0 +1,18 @@
+services:
+  skimmer:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      MINIFLUX_URL: ${MINIFLUX_URL}
+      MINIFLUX_TOKEN: ${MINIFLUX_TOKEN}
+      MINIFLUX_USERNAME: ${MINIFLUX_USERNAME:-}
+      MINIFLUX_PASSWORD: ${MINIFLUX_PASSWORD:-}
+      SKIMMER_FETCH_LIMIT: ${SKIMMER_FETCH_LIMIT:-100}
+      SKIMMER_WRITE_BACK: ${SKIMMER_WRITE_BACK:-false}
+    volumes:
+      - ./data:/data
+    env_file:
+      - path: .env
+        required: false

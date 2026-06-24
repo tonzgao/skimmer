@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkimmerDecision",
+  "type": "object",
+  "required": [
+    "observed_at",
+    "entry_id",
+    "classification",
+    "confidence",
+    "reasons",
+    "write_back"
+  ],
+  "properties": {
+    "observed_at": { "type": "string" },
+    "entry_id": { "type": ["integer", "string", "null"] },
+    "title": { "type": ["string", "null"] },
+    "url": { "type": ["string", "null"] },
+    "feed": { "type": ["string", "null"] },
+    "category_source": { "type": ["string", "null"] },
+    "classification": {
+      "type": "string",
+      "enum": ["must_read", "possible_interest", "ignore"]
+    },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "reasons": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "ai_written_signal": { "type": "boolean" },
+    "write_back": { "type": "boolean" },
+    "write_back_action": {
+      "type": ["string", "null"],
+      "enum": ["mark_read", null]
+    },
+    "manual": { "type": "boolean" },
+    "done": { "type": [ "boolean", "null" ] },
+    "miniflux_read": { "type": [ "boolean", "null" ] },
+    "status": { "type": ["string", "null"], "enum": ["read", "unread", null] }
+  }
+}
