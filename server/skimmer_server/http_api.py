@@ -4,7 +4,9 @@ import json
 import base64
 import re
 import signal
+import sys
 import threading
+import traceback
 from datetime import datetime, timedelta, timezone
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -440,11 +442,33 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, OSError, RuntimeError) as exc:
             self._json({"ok": False, "error": str(exc)}, 500)
             return
+        except Exception:
+            # Unexpected bug in a handler: report it, log the traceback for
+            # docker logs, and keep the server alive.
+            print(
+                f"ERROR handling {self.command} {self.path}\n"
+                + traceback.format_exc(),
+                file=sys.stderr,
+                flush=True,
+            )
+            try:
+                self._json({"ok": False, "error": "internal server error"}, 500)
+            except Exception:
+                pass
+            return
 
         self.send_error(404)
 
     def log_message(self, format: str, *args: object) -> None:
         return
+
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        except Exception:
+            # Network-level or framework-level failure in a worker thread:
+            # never let it kill the server process silently.
+            print(traceback.format_exc(), file=sys.stderr, flush=True)
 
     def _redirect(self, location: str) -> None:
         self.send_response(303)

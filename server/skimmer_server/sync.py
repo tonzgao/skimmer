@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -96,6 +97,15 @@ class BackgroundSync:
                 self.last_error = None
             except Exception as exc:
                 self.last_error = str(exc)
+                # Sync failures must be visible in docker logs, not just the
+                # status endpoint.
+                import traceback
+
+                print(
+                    f"SYNC ERROR: {exc}\n{traceback.format_exc()}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             self._wake.wait(self.interval_seconds)
             self._wake.clear()
 
