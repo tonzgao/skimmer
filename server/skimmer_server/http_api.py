@@ -28,7 +28,7 @@ CLASSIFICATION_LABELS = {
 }
 
 # Paths reachable without a valid session when a password is configured.
-PUBLIC_PATHS = {"/login", "/logout", "/stylesheets/skimmer.css", "/favicon.svg", "/health"}
+PUBLIC_PATHS = {"/login", "/logout", "/stylesheets/skimmer.css", "/favicon.svg", "/health", "/model/summary"}
 PUBLIC_PATH_PREFIXES = {"/feed-icon"}
 
 
@@ -177,6 +177,32 @@ class Handler(BaseHTTPRequestHandler):
                     store.mark_local_read([done_row])
                     sync.request_status_change(entry_id, "read")
                 self._redirect(f"/category/{classification}")
+                return
+
+            if parsed.path == "/model/summary":
+                # Portable classification summary: per-feature preferences,
+                # no article data, no secrets. Lets a local dev instance
+                # bootstrap the classifier from the live server.
+                from .portable import summarize_from_history
+
+                history_rows = []
+                if config.history_path.exists():
+                    import json as _json
+
+                    for line in config.history_path.read_text(encoding="utf-8").splitlines():
+                        if line.strip():
+                            try:
+                                history_rows.append(_json.loads(line))
+                            except ValueError:
+                                continue
+                summary = summarize_from_history(sync.classifier.model, history_rows) if sync.classifier else {}
+                payload = json.dumps(summary, sort_keys=True).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
                 return
 
             if parsed.path == "/favicon.svg":
