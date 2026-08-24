@@ -14,6 +14,21 @@ def append_decisions(path: Path, decisions: list[dict]) -> None:
             handle.write("\n")
 
 
+def write_decisions(path: Path, decisions: list[dict]) -> None:
+    """Atomically replace the decisions log (used by compaction)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix=path.name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            for decision in decisions:
+                handle.write(json.dumps(decision, sort_keys=True))
+                handle.write("\n")
+        os.replace(tmp_path, path)
+    except BaseException:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
+
+
 def read_latest_decisions(path: Path, limit: int | None = None) -> list[dict]:
     """Return one current state per entry, newest update winning.
 

@@ -215,9 +215,10 @@ a:hover {
     font-size: 1rem;
     cursor: pointer;
 
-    &:is(:hover, :focus) {
-        color: var(--link-hover-color);
-    }
+}
+
+.page-button:is(:hover, :focus) {
+    color: var(--link-hover-color);
 }
 
 .page-button:active {
@@ -980,18 +981,6 @@ dialog {
     gap: 6px;
 }
 
-.classification-button.classification-auto {
-    font-style: italic;
-}
-
-.classification-button.classification-manual {
-    font-weight: bold;
-}
-
-.classification-button[aria-current="true"] {
-    color: var(--body-color);
-}
-
 .classification-button {
     color: var(--link-color);
     background: transparent;
@@ -1008,17 +997,19 @@ dialog {
     border-color: var(--link-hover-color);
 }
 
-.classification-button[aria-current="true"] {
-    color: var(--body-color);
-}
-
-.classification-button.classification-auto[aria-current="true"] {
+.classification-actions .classification-button.classification-auto {
     font-style: italic;
     font-weight: normal;
 }
 
-.classification-button.classification-manual[aria-current="true"] {
+.classification-actions .classification-button.classification-manual {
     font-weight: bold;
+    font-style: normal;
+}
+
+.classification-actions .classification-button[aria-current="true"] {
+    color: var(--body-color);
+    border-color: var(--body-color);
 }
 
 .hide-read-items .item-status-read:not(.current-item) {
@@ -1506,14 +1497,6 @@ footer .elevator {
 
 .classification-label.classification-bold {
     font-style: normal;
-    font-weight: bold;
-}
-
-button.classification-auto[aria-pressed="true"] {
-    font-style: italic;
-}
-
-button.classification-manual[aria-pressed="true"] {
     font-weight: bold;
 }
 

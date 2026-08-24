@@ -27,20 +27,21 @@ try:
     assert 'classification-label' not in html
     print("no yellow labels on category page: OK")
 
-    # --- prev/next orientation: list is newest-first; reading order follows
-    # the list, so Next goes down (older id 500) and Previous goes up (newer).
-    # toggled=1 renders without marking entries done, keeping both in the folder.
-    html = urllib.request.urlopen(f"{base}/entry?id=501&toggled=1&folder=/category/ignore").read().decode()
-    next_link = re.search(r'pagination-next[^>]*href="([^"]+)"', html)
-    assert next_link and "id=500" in next_link.group(1), f"Next should go to older entry 500, got {next_link and next_link.group(1)}"
-    assert not re.search(r'pagination-prev[^>]*href=', html), "newest entry should have no Previous"
-    print("Next -> older (list order), no Previous on newest: OK")
-
+    # --- prev/next orientation: folders are oldest-first (Miniflux style);
+    # reading order follows the list, so Next goes down (newer id 501) and
+    # Previous goes up (older). toggled=1 renders without marking entries
+    # done, keeping both in the folder.
     html = urllib.request.urlopen(f"{base}/entry?id=500&toggled=1&folder=/category/ignore").read().decode()
+    next_link = re.search(r'pagination-next[^>]*href="([^"]+)"', html)
+    assert next_link and "id=501" in next_link.group(1), f"Next should go to newer entry 501, got {next_link and next_link.group(1)}"
+    assert not re.search(r'pagination-prev[^>]*href=', html), "oldest entry should have no Previous"
+    print("Next -> newer (list order), no Previous on oldest: OK")
+
+    html = urllib.request.urlopen(f"{base}/entry?id=501&toggled=1&folder=/category/ignore").read().decode()
     prev_link = re.search(r'class="pagination-prev" href="([^"]+)"', html)
-    assert prev_link and "id=501" in prev_link.group(1), f"Previous should be 501, got {prev_link and prev_link.group(1)}"
+    assert prev_link and "id=500" in prev_link.group(1), f"Previous should be 500, got {prev_link and prev_link.group(1)}"
     assert not re.search(r'class="pagination-next" href=', html)
-    print("Previous -> newer, no Next on oldest: OK")
+    print("Previous -> older, no Next on newest: OK")
 
     # --- unread persistence across navigation
     body = urllib.parse.urlencode({"entry_id": "501", "status": "unread", "folder": "/category/ignore"}).encode()

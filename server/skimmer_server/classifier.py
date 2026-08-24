@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .learn import SoftmaxModel, load_model, min_training_examples, train_from_history
+from .portable import SummaryModel, load_or_fetch_summary
 
 
 CATEGORY_MUST_READ = "must_read"
@@ -27,10 +28,11 @@ class Classification:
 class Classifier:
     """Learns from skimmer feedback history; optional keyword rules act as priors.
 
-    The model is a multinomial logistic regression trained on every manual
-    override and implicit read signal in the decision log (see learn.py).
-    Keyword lists from config are still honoured as hard overrides when set,
-    but they are no longer required for useful classifications.
+    The model is a multinomial logistic regression trained only on manual
+    overrides in the decision log (see learn.py) — reading an article
+    elsewhere is not treated as a label. Keyword lists from config are still
+    honoured as hard overrides when set, but they are not required for
+    useful classifications.
     """
 
     def __init__(
@@ -50,10 +52,16 @@ class Classifier:
         self.model = SoftmaxModel()
         if history_rows:
             self.retrain(history_rows)
-        elif model_path is not None:
-            # No feedback yet: fall back to the last persisted pass so
-            # classifications stay consistent across restarts.
-            self.model = load_model(model_path)
+        else:
+            # No local feedback yet: bootstrap from a portable summary — the
+            # committed model_summary.json, or a live checkpoint fetched from
+            # SKIMMER_MODEL_URL when developing away from the server.
+            summary = load_or_fetch_summary(
+                (model_path.parent / "model_summary.json") if model_path else Path("model_summary.json"),
+                url=_model_url(),
+            )
+            if summary:
+                self.model = SummaryModel.from_summary(summary)
 
     def retrain(self, history_rows: list[dict]) -> int:
         """Rebuild the model from the full decision log.
@@ -88,6 +96,13 @@ class Classifier:
         label, probability = self.model.predict(entry)
         reasons.append(_model_reason(label, probability))
         return Classification(label, probability, reasons, ai_signal)
+
+
+def _model_url() -> str | None:
+    """Optional live checkpoint endpoint, e.g. your server's /model/summary."""
+    import os
+
+    return os.environ.get("SKIMMER_MODEL_URL") or None
 
 
 def _rule_classification(haystack: str, classifier: "Classifier") -> tuple[str, float, str] | None:

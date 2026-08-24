@@ -11,7 +11,7 @@ The server is the source of truth for decisions. The local client only inspects 
 ## Highlights
 
 - **Review UI:** Miniflux-style uncategorized, category, feed, entry, and history views with manual labels, Done, bulk Done, and Fetch now.
-- **Feedback learning:** Manual labels and implicit done/read behavior train a small softmax classifier. Keyword rules remain hard overrides.
+- **Feedback learning:** Manual labels train a small softmax classifier with class-balanced weighting. Entries read elsewhere are not treated as opinions. Keyword rules remain hard overrides.
 - **Background sync:** The HTTP service reconciles Miniflux state, discovers new entries, rescores open items, refreshes catalogs, and flushes queued writebacks every 5 minutes. Pending Skimmer clicks are flushed to Miniflux before each reconciliation pass, so Miniflux is never treated as authoritative over newer local actions.
 - **Single read state:** Read = done. Opening an article marks it read in Miniflux and finishes it in Skimmer; marking it unread anywhere reopens it back onto its category list. Category pages, reader pagination, and the nav counters all share this one definition, so counts always match what a page shows.
 - **Safe defaults:** No writeback occurs unless explicitly enabled. With writeback enabled, automatic `ignore` decisions are marked read; other categories remain unread.
@@ -124,6 +124,26 @@ dock compose up -d --build
 
 Use `docker compose` instead if that is the command installed on your machine.
 
+### Plain `docker run` (no compose)
+
+If you'd rather skip Compose entirely — for example next to a Miniflux that runs directly on the host:
+
+```sh
+docker run -d --name skimmer --network host \
+  -v /root/skimmer-data:/data \
+  --env-file .env \
+  skimmer
+```
+
+Notes:
+
+- `--network host` puts the container on the host network, so `MINIFLUX_URL=http://localhost:8080` works when Miniflux runs on the same machine (and Skimmer binds to `SKIMMER_HOST`, which should be `127.0.0.1` here to stay off the public interface).
+- Without `--network host`, publish the port instead: `-p 127.0.0.1:8765:8765`, set `SKIMMER_HOST=0.0.0.0`, and use the host gateway or Miniflux's container address as `MINIFLUX_URL`.
+- The container shuts down promptly on `docker stop`; no force-remove needed.
+- If your Docker command is actually podman emulating it, prefer real `podman` subcommands for lifecycle operations (`podman stop`, `podman rm`) and avoid `container prune`, which can sweep containers you meant to keep.
+
+Use `docker compose` instead of `docker build`/`run` if that is what's installed; both work identically here.
+
 `compose.yaml` builds the local image, applies `restart: unless-stopped`, loads `.env`, and publishes only to localhost:
 
 ```yaml
@@ -161,6 +181,18 @@ dock compose logs -f skimmer
 dock compose up -d --force-recreate --build
 dock compose down
 ```
+
+### Updating
+
+To pull the latest code and redeploy in one step:
+
+```sh
+./scripts_update.sh
+```
+
+The script auto-detects docker vs podman, pulls the repo, compacts the data (drops superseded decision rows and stored article content), rebuilds the image, recreates the container, and waits for `/health` to answer — printing recent logs if startup fails. It works identically for compose and plain `docker run` setups.
+
+Data storage is deliberately lean: decision rows hold only classification metadata, not article bodies (the reader fetches content live from Miniflux). Run `uv run python -m skimmer_server compact` from `server/` occasionally to rewrite the log keeping one row per entry; it is safe to run any time the worker is stopped.
 
 ## Scheduling
 

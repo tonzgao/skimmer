@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -96,6 +97,15 @@ class BackgroundSync:
                 self.last_error = None
             except Exception as exc:
                 self.last_error = str(exc)
+                # Sync failures must be visible in docker logs, not just the
+                # status endpoint.
+                import traceback
+
+                print(
+                    f"SYNC ERROR: {exc}\n{traceback.format_exc()}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             self._wake.wait(self.interval_seconds)
             self._wake.clear()
 
@@ -162,20 +172,51 @@ class BackgroundSync:
         return changed
 
     def _ensure_classifier(self) -> Classifier:
-        """Build the classifier once per process; retrain on every sync so the
-        model keeps learning from fresh overrides and read signals."""
+        """Build/load the classifier once per process; normal syncs reuse it.
+
+        Training is an explicit `train-model` cron operation because expected
+        manual-label volume is high enough for retraining to be expensive.
+        """
         if self.classifier is None:
             model_path = self.config.data_dir / "model.json"
             self.classifier = Classifier(
                 must_read_keywords=self.config.must_read_keywords,
                 possible_interest_keywords=self.config.possible_interest_keywords,
                 ignore_keywords=self.config.ignore_keywords,
-                history_rows=self.store.rows(),
+                history_rows=[],
                 model_path=model_path,
             )
-            return self.classifier
-        self.classifier.retrain(self.store.rows())
+        self._last_manual_count = len(self._manual_rows())
         return self.classifier
+
+    def train_model(self) -> int:
+        """Explicitly rebuild and persist the model for cron use."""
+        classifier = self.classifier or Classifier(
+            must_read_keywords=self.config.must_read_keywords,
+            possible_interest_keywords=self.config.possible_interest_keywords,
+            ignore_keywords=self.config.ignore_keywords,
+            history_rows=[],
+            model_path=self.config.data_dir / "model.json",
+        )
+        self.classifier = classifier
+        used = classifier.retrain(self._manual_rows())
+        self._last_manual_count = len(self._manual_rows())
+        return used
+
+    def _manual_rows(self) -> list[dict]:
+        """Only rows with explicit user labels are training data (and only
+        their metadata is needed — content is stripped before training)."""
+        slim = []
+        for row in self.store.rows():
+            if not row.get("manual"):
+                continue
+            row = dict(row)
+            row.pop("content", None)
+            source = row.get("source_entry")
+            if isinstance(source, dict):
+                row["source_entry"] = {k: v for k, v in source.items() if k != "content"}
+            slim.append(row)
+        return slim
 
     def _reconcile(
         self,
@@ -231,7 +272,6 @@ class BackgroundSync:
                 **(current.get("source_entry") or {}),
                 **(entry.get("_source_entry") or {}),
                 "id": entry_id,
-                "content": entry.get("content"),
                 "author": entry.get("author"),
                 "status": "unread",
                 "feed": entry.get("feed") or (current.get("source_entry") or {}).get("feed"),
@@ -343,18 +383,19 @@ class BackgroundSync:
 def _decision_fields(entry: dict) -> dict:
     feed = entry.get("feed")
     category = entry.get("category")
+    # Article content is deliberately NOT persisted: it is bulky (~40KB/row),
+    # immutable reference data, and the reader fetches it live from Miniflux.
+    # Only classification-relevant metadata is kept here.
     return {
         "entry_id": entry.get("id"),
         "title": entry.get("title"),
         "url": entry.get("url"),
         "author": entry.get("author"),
-        "content": entry.get("content"),
         "published_at": entry.get("published_at"),
         "feed": feed.get("title") if isinstance(feed, dict) else None,
         "category_source": category.get("title") if isinstance(category, dict) else None,
         "source_entry": {
             "id": entry.get("id"),
-            "content": entry.get("content"),
             "author": entry.get("author"),
             "status": entry.get("status"),
             "feed": feed,

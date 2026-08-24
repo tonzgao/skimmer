@@ -3,6 +3,10 @@ from __future__ import annotations
 import json
 import base64
 import re
+import signal
+import sys
+import threading
+import traceback
 from datetime import datetime, timedelta, timezone
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,7 +30,7 @@ CLASSIFICATION_LABELS = {
 }
 
 # Paths reachable without a valid session when a password is configured.
-PUBLIC_PATHS = {"/login", "/logout", "/stylesheets/skimmer.css", "/favicon.svg", "/health"}
+PUBLIC_PATHS = {"/login", "/logout", "/stylesheets/skimmer.css", "/favicon.svg", "/health", "/model/summary"}
 PUBLIC_PATH_PREFIXES = {"/feed-icon"}
 
 
@@ -52,8 +56,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if parsed.path in {"", "/"}:
-                decisions = [row for row in store.unread(limit=None) if not row.get("manual")]
-                self._html(_uncategorized_html(decisions, config.write_back, store=store))
+                decisions = _folder_rows("/", config, store)
+                self._html(_entry_list_html(decisions, {}, "Pending", archive=False, classify=True, bulk_next="/", next_url="/", store=store, config=config))
                 return
 
             if parsed.path == "/history":
@@ -74,7 +78,7 @@ class Handler(BaseHTTPRequestHandler):
                 classification = parsed.path.removeprefix("/category/")
                 if classification not in CLASSIFICATIONS:
                     raise ValueError("Unknown review category")
-                decisions = store.by_category(classification)
+                decisions = _folder_rows(f"/category/{classification}", config, store)
                 title = classification.replace("_", " ").title()
                 next_url = f"/category/{classification}"
                 self._html(_entry_list_html(decisions, {}, title, archive=True, classify=True, bulk_next=next_url, next_url=next_url, store=store, config=config))
@@ -83,7 +87,7 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/category":
                 raw_id = query.get("id", [None])[0]
                 if raw_id in CLASSIFICATIONS:
-                    decisions = store.by_category(raw_id)
+                    decisions = _folder_rows(f"/category?id={raw_id}", config, store)
                     title = raw_id.replace("_", " ").title()
                     next_url = f"/category?id={raw_id}"
                     self._html(_entry_list_html(decisions, {}, title, archive=True, classify=True, bulk_next=next_url, next_url=next_url, store=store, config=config))
@@ -177,6 +181,32 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect(f"/category/{classification}")
                 return
 
+            if parsed.path == "/model/summary":
+                # Portable classification summary: per-feature preferences,
+                # no article data, no secrets. Lets a local dev instance
+                # bootstrap the classifier from the live server.
+                from .portable import summarize_from_history
+
+                history_rows = []
+                if config.history_path.exists():
+                    import json as _json
+
+                    for line in config.history_path.read_text(encoding="utf-8").splitlines():
+                        if line.strip():
+                            try:
+                                history_rows.append(_json.loads(line))
+                            except ValueError:
+                                continue
+                summary = summarize_from_history(sync.classifier.model, history_rows) if sync.classifier else {}
+                payload = json.dumps(summary, sort_keys=True).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+
             if parsed.path == "/favicon.svg":
                 favicon_path = Path(__file__).parent / "static" / "favicon.svg"
                 data = favicon_path.read_bytes()
@@ -213,7 +243,7 @@ class Handler(BaseHTTPRequestHandler):
                         icon = MinifluxClient(config).get_feed_icon(feed_id)
                     except Exception:
                         icon = {}
-                    self.server.icon_cache[cache_key] = {"payload": icon}
+                    self.server.icon_cache[cache_key] = icon
                 self._icon(icon)
                 return
 
@@ -412,11 +442,33 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, OSError, RuntimeError) as exc:
             self._json({"ok": False, "error": str(exc)}, 500)
             return
+        except Exception:
+            # Unexpected bug in a handler: report it, log the traceback for
+            # docker logs, and keep the server alive.
+            print(
+                f"ERROR handling {self.command} {self.path}\n"
+                + traceback.format_exc(),
+                file=sys.stderr,
+                flush=True,
+            )
+            try:
+                self._json({"ok": False, "error": "internal server error"}, 500)
+            except Exception:
+                pass
+            return
 
         self.send_error(404)
 
     def log_message(self, format: str, *args: object) -> None:
         return
+
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        except Exception:
+            # Network-level or framework-level failure in a worker thread:
+            # never let it kill the server process silently.
+            print(traceback.format_exc(), file=sys.stderr, flush=True)
 
     def _redirect(self, location: str) -> None:
         self.send_response(303)
@@ -524,7 +576,20 @@ def serve(config: Config) -> None:
     httpd.sync = BackgroundSync(config, httpd.store)
     httpd.sync.start()
     print(f"Serving Skimmer API on http://{config.host}:{config.port}", flush=True)
-    httpd.serve_forever()
+
+    def _shutdown(signum, frame) -> None:
+        # SIGTERM/SIGINT (docker stop, Ctrl-C): stop the sync worker and the
+        # HTTP loop promptly so container shutdown never hangs.
+        httpd.sync.stop()
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+    try:
+        httpd.serve_forever()
+    finally:
+        httpd.server_close()
+        httpd.sync.stop()
 
 
 def _parse_dt(value: object) -> datetime | None:
@@ -686,21 +751,6 @@ window.addEventListener('pageshow', (event) => {
 </body></html>"""
 
 
-def _uncategorized_html(decisions: list[dict], write_back_enabled: bool, title: str = "Pending", *, store=None) -> str:
-    # Pending = every open entry whose label came from the algorithm, not
-    # from the user. Manual overrides leave this page immediately.
-    pending = [row for row in decisions if not row.get("manual")]
-    items = [_item_markup(row, {}, include_source=True, classify=True, next_url="/") for row in pending]
-    content = (
-        '<div class="items">'
-        + ("".join(items) if items else '<p role="alert" class="alert">No pending entries.</p>')
-        + "</div>"
-    )
-    return _page(title, f'<h1 id="page-header-title">{escape(title)} <span aria-hidden="true" class="unread-counter-wrapper">(<span class="unread-counter">{len(pending)})</span></span></h1>', content, store=store)
-
-
-
-
 HISTORY_LIMIT = 300
 
 
@@ -716,7 +766,7 @@ def _history_rows(store) -> list[dict]:
 
 
 def _folder_rows(context: str | None, config: Config, store: StateStore) -> list[dict]:
-    """All rows belonging to the folder identified by ``context``, newest first.
+    """All rows belonging to the folder identified by ``context``.
 
     This is the single definition of "what's in this folder" — the list pages
     render from it and reader pagination walks it, so the two can never
@@ -729,12 +779,13 @@ def _folder_rows(context: str | None, config: Config, store: StateStore) -> list
     parsed = urlparse(context)
     query = parse_qs(parsed.query)
 
+    # Working folders list oldest first; History is newest-first by done time.
+
     if parsed.path in {"", "/"}:
         # Pending: open entries whose label came from the algorithm.
         return sorted(
             (row for row in store.unread(limit=None) if not row.get("manual")),
             key=_published_sort_key,
-            reverse=True,
         )
 
     classification = parsed.path.removeprefix("/category/")
@@ -751,14 +802,15 @@ def _folder_rows(context: str | None, config: Config, store: StateStore) -> list
         else None
     )
     if review_category:
-        # Working category: UNREAD entries with this label (same definition as
-        # StateStore.by_category and the nav counter — all three must agree;
-        # read entries leave the working list, done or not).
+        # Working category: open algorithm-labeled entries. Manual labels are
+        # explicit decisions and move to their folder/history immediately.
         rows = [
             row for row in store.rows()
-            if row.get("classification") == review_category and row.get("status") != "read"
+            if row.get("classification") == review_category
+            and row.get("status") != "read"
+            and not row.get("manual")
         ]
-        return sorted(rows, key=_published_sort_key, reverse=True)
+        return sorted(rows, key=_published_sort_key)
 
     if parsed.path == "/category":
         category_id = int(query.get("id", ["0"])[0])
@@ -770,7 +822,7 @@ def _folder_rows(context: str | None, config: Config, store: StateStore) -> list
                 or (row.get("source_entry") or {}).get("category", {}).get("id") == category_id
             )
         ]
-        return sorted(rows, key=_published_sort_key, reverse=True)
+        return sorted(rows, key=_published_sort_key)
 
     if parsed.path == "/feed":
         feed_id = int(query.get("id", ["0"])[0])
@@ -779,7 +831,7 @@ def _folder_rows(context: str | None, config: Config, store: StateStore) -> list
             if not row.get("done")
             and (row.get("source_entry") or {}).get("feed", {}).get("id") == feed_id
         ]
-        return sorted(rows, key=_published_sort_key, reverse=True)
+        return sorted(rows, key=_published_sort_key)
 
     return []
 
@@ -810,20 +862,19 @@ def _entry_neighbors(context: str | None, entry_id: int, config: Config, store: 
         None,
     )
     if position is not None:
-        # Reading order follows the list (newest-first): Next goes to the
-        # next entry down (older), Previous goes back up (newer).
         return (
             ordered[position - 1] if position > 0 else None,
             ordered[position + 1] if position + 1 < len(ordered) else None,
         )
 
     # Current item left the folder: walk its remaining members by date.
-    # Previous = nearest newer, Next = nearest older.
-    older = [row for row in ordered if _published_sort_key(row) < current_key]
-    newer = [row for row in ordered if _published_sort_key(row) > current_key]
-    previous = min(newer, key=_published_sort_key) if newer else None
-    following = max(older, key=_published_sort_key) if older else None
-    return previous, following
+    # The list order already defines Previous/Next, regardless of whether it
+    # uses published dates (working folders) or done times (History).
+    before = [row for row in ordered if _published_sort_key(row) < current_key]
+    after = [row for row in ordered if _published_sort_key(row) > current_key]
+    nearest_before = max(before, key=_published_sort_key) if before else None
+    nearest_after = min(after, key=_published_sort_key) if after else None
+    return nearest_before, nearest_after
 
 
 
@@ -839,10 +890,15 @@ def _entry_list_html(
     store=None,
     config=None,
 ) -> str:
-    # Manual/auto styling must consult the live overrides log; decision rows
-    # alone can lag behind (e.g. an override written without a new decision).
+    # List rendering and reader rendering must resolve entry state through the
+    # same helper. The live override log is the authoritative source for
+    # whether a label is manual.
     if config is not None:
         overrides = read_overrides(config.overrides_path)
+        for row in entries:
+            override = overrides.get(row.get("entry_id"))
+            if override:
+                row["manual"] = True
     items = [
         _item_markup(row, overrides, include_source=True, archive=archive, classify=classify, next_url=next_url, done_next=next_url)
         for row in entries
