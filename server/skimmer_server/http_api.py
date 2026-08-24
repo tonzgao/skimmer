@@ -56,8 +56,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if parsed.path in {"", "/"}:
-                decisions = [row for row in store.unread(limit=None) if not row.get("manual")]
-                self._html(_uncategorized_html(decisions, config.write_back, store=store))
+                decisions = _folder_rows("/", config, store)
+                self._html(_entry_list_html(decisions, {}, "Pending", archive=False, classify=True, bulk_next="/", next_url="/", store=store, config=config))
                 return
 
             if parsed.path == "/history":
@@ -78,7 +78,7 @@ class Handler(BaseHTTPRequestHandler):
                 classification = parsed.path.removeprefix("/category/")
                 if classification not in CLASSIFICATIONS:
                     raise ValueError("Unknown review category")
-                decisions = store.by_category(classification)
+                decisions = _folder_rows(f"/category/{classification}", config, store)
                 title = classification.replace("_", " ").title()
                 next_url = f"/category/{classification}"
                 self._html(_entry_list_html(decisions, {}, title, archive=True, classify=True, bulk_next=next_url, next_url=next_url, store=store, config=config))
@@ -87,7 +87,7 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/category":
                 raw_id = query.get("id", [None])[0]
                 if raw_id in CLASSIFICATIONS:
-                    decisions = store.by_category(raw_id)
+                    decisions = _folder_rows(f"/category?id={raw_id}", config, store)
                     title = raw_id.replace("_", " ").title()
                     next_url = f"/category?id={raw_id}"
                     self._html(_entry_list_html(decisions, {}, title, archive=True, classify=True, bulk_next=next_url, next_url=next_url, store=store, config=config))
@@ -243,7 +243,7 @@ class Handler(BaseHTTPRequestHandler):
                         icon = MinifluxClient(config).get_feed_icon(feed_id)
                     except Exception:
                         icon = {}
-                    self.server.icon_cache[cache_key] = {"payload": icon}
+                    self.server.icon_cache[cache_key] = icon
                 self._icon(icon)
                 return
 
@@ -751,21 +751,6 @@ window.addEventListener('pageshow', (event) => {
 </body></html>"""
 
 
-def _uncategorized_html(decisions: list[dict], write_back_enabled: bool, title: str = "Pending", *, store=None) -> str:
-    # Pending = every open entry whose label came from the algorithm, not
-    # from the user. Manual overrides leave this page immediately.
-    pending = [row for row in decisions if not row.get("manual")]
-    items = [_item_markup(row, {}, include_source=True, classify=True, next_url="/") for row in pending]
-    content = (
-        '<div class="items">'
-        + ("".join(items) if items else '<p role="alert" class="alert">No pending entries.</p>')
-        + "</div>"
-    )
-    return _page(title, f'<h1 id="page-header-title">{escape(title)} <span aria-hidden="true" class="unread-counter-wrapper">(<span class="unread-counter">{len(pending)})</span></span></h1>', content, store=store)
-
-
-
-
 HISTORY_LIMIT = 300
 
 
@@ -781,7 +766,7 @@ def _history_rows(store) -> list[dict]:
 
 
 def _folder_rows(context: str | None, config: Config, store: StateStore) -> list[dict]:
-    """All rows belonging to the folder identified by ``context``, newest first.
+    """All rows belonging to the folder identified by ``context``.
 
     This is the single definition of "what's in this folder" — the list pages
     render from it and reader pagination walks it, so the two can never
@@ -794,7 +779,7 @@ def _folder_rows(context: str | None, config: Config, store: StateStore) -> list
     parsed = urlparse(context)
     query = parse_qs(parsed.query)
 
-    # Miniflux convention: every folder lists oldest first.
+    # Working folders list oldest first; History is newest-first by done time.
 
     if parsed.path in {"", "/"}:
         # Pending: open entries whose label came from the algorithm.
@@ -817,12 +802,13 @@ def _folder_rows(context: str | None, config: Config, store: StateStore) -> list
         else None
     )
     if review_category:
-        # Working category: UNREAD entries with this label (same definition as
-        # StateStore.by_category and the nav counter — all three must agree;
-        # read entries leave the working list, done or not).
+        # Working category: open algorithm-labeled entries. Manual labels are
+        # explicit decisions and move to their folder/history immediately.
         rows = [
             row for row in store.rows()
-            if row.get("classification") == review_category and row.get("status") != "read"
+            if row.get("classification") == review_category
+            and row.get("status") != "read"
+            and not row.get("manual")
         ]
         return sorted(rows, key=_published_sort_key)
 
@@ -876,21 +862,19 @@ def _entry_neighbors(context: str | None, entry_id: int, config: Config, store: 
         None,
     )
     if position is not None:
-        # Reading order follows the list (oldest-first, Miniflux style):
-        # Next goes to the next entry down (newer), Previous goes back
-        # up (older).
         return (
             ordered[position - 1] if position > 0 else None,
             ordered[position + 1] if position + 1 < len(ordered) else None,
         )
 
     # Current item left the folder: walk its remaining members by date.
-    # Previous = nearest older, Next = nearest newer.
-    older = [row for row in ordered if _published_sort_key(row) < current_key]
-    newer = [row for row in ordered if _published_sort_key(row) > current_key]
-    previous = max(older, key=_published_sort_key) if older else None
-    following = min(newer, key=_published_sort_key) if newer else None
-    return previous, following
+    # The list order already defines Previous/Next, regardless of whether it
+    # uses published dates (working folders) or done times (History).
+    before = [row for row in ordered if _published_sort_key(row) < current_key]
+    after = [row for row in ordered if _published_sort_key(row) > current_key]
+    nearest_before = max(before, key=_published_sort_key) if before else None
+    nearest_after = min(after, key=_published_sort_key) if after else None
+    return nearest_before, nearest_after
 
 
 
@@ -906,10 +890,15 @@ def _entry_list_html(
     store=None,
     config=None,
 ) -> str:
-    # Manual/auto styling must consult the live overrides log; decision rows
-    # alone can lag behind (e.g. an override written without a new decision).
+    # List rendering and reader rendering must resolve entry state through the
+    # same helper. The live override log is the authoritative source for
+    # whether a label is manual.
     if config is not None:
         overrides = read_overrides(config.overrides_path)
+        for row in entries:
+            override = overrides.get(row.get("entry_id"))
+            if override:
+                row["manual"] = True
     items = [
         _item_markup(row, overrides, include_source=True, archive=archive, classify=classify, next_url=next_url, done_next=next_url)
         for row in entries
