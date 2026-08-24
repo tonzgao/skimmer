@@ -28,10 +28,11 @@ class Classification:
 class Classifier:
     """Learns from skimmer feedback history; optional keyword rules act as priors.
 
-    The model is a multinomial logistic regression trained on every manual
-    override and implicit read signal in the decision log (see learn.py).
-    Keyword lists from config are still honoured as hard overrides when set,
-    but they are no longer required for useful classifications.
+    The model is a multinomial logistic regression trained only on manual
+    overrides in the decision log (see learn.py) — reading an article
+    elsewhere is not treated as a label. Keyword lists from config are still
+    honoured as hard overrides when set, but they are not required for
+    useful classifications.
     """
 
     def __init__(

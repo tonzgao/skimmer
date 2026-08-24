@@ -8,9 +8,10 @@ model persists as JSON in the data directory so it survives restarts.
 Design constraints:
 - fast: scoring an entry is a few hundred float multiplies;
 - low resource: no numpy/sklearn, weights only exist for observed features;
-- actually updating: every manual override and every implicit signal
-  (read-without-interaction vs done-in-skimmer) becomes a fresh training row,
+- actually updating: every manual override becomes a fresh training row,
   with recency weighting so the model tracks drifting preferences;
+- honest labels only: entries read elsewhere (no skimmer interaction) are
+  NOT training signal — reading is not an opinion;
 - flexible: nothing about feeds, authors, domains, or words is hardcoded —
   everything is learned from the feedback history.
 """
@@ -177,15 +178,15 @@ def train_from_history(
     *,
     now: float | None = None,
 ) -> int:
-    """Train on every usable decision row; newest rows weigh most.
+    """Train on manual labels only; newest rows weigh most.
 
-    Labels come from explicit manual overrides first, then implicit signals:
-    entries read in Miniflux without any skimmer interaction are `ignore`,
-    entries marked done inside skimmer carry their assigned classification.
+    With few examples the class distribution is naturally imbalanced, so each
+    example is weighted inversely to its class frequency — every label the
+    user gives matters equally regardless of how common that class is.
     Returns the number of training examples applied.
     """
     clock = time.time() if now is None else now
-    used = 0
+    labeled: list[tuple[dict, str, float]] = []
     for row in rows:
         label = _label_for(row)
         if label is None:
@@ -193,10 +194,18 @@ def train_from_history(
         entry = _entry_view(row)
         age_days = max(_observed_age_days(row, clock), 0.0)
         recency_weight = 0.5 ** (age_days / RECENCY_HALF_LIFE_DAYS)
-        trust = 1.0 if row.get("manual") else 0.5
-        model.train(entry, label, weight=trust * recency_weight)
-        used += 1
-    return used
+        labeled.append((entry, label, recency_weight))
+    if not labeled:
+        return 0
+
+    # Balanced class weights (computed on this batch).
+    counts: Counter = Counter(label for _, label, _ in labeled)
+    total = sum(counts.values())
+    class_weight = {label: total / (len(CLASSES) * count) for label, count in counts.items()}
+
+    for entry, label, recency_weight in labeled:
+        model.train(entry, label, weight=recency_weight * class_weight[label])
+    return len(labeled)
 
 
 def _softmax(scores: list[float]) -> list[float]:
@@ -241,16 +250,18 @@ def _entry_view(row: dict) -> dict:
 
 
 def _label_for(row: dict) -> str | None:
+    """Only explicit user decisions are training signal.
+
+    Manual overrides carry their label. Everything else — including entries
+    read elsewhere in Miniflux without any skimmer interaction — is excluded
+    entirely: reading an article is not an opinion about it, and treating
+    those as 'ignore' taught the model to bury good articles.
+    """
+    if not row.get("manual"):
+        return None
     classification = row.get("classification")
     if classification not in CLASS_INDEX:
         return None
-    if row.get("manual"):
-        return str(classification)
-    if not row.get("done"):
-        return None
-    # Done without any skimmer interaction means the user read it elsewhere.
-    if str(classification) == CATEGORY_POSSIBLE_INTEREST and row.get("status") == "read":
-        return CATEGORY_IGNORE
     return str(classification)
 
 

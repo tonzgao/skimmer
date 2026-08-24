@@ -11,7 +11,7 @@ The server is the source of truth for decisions. The local client only inspects 
 ## Highlights
 
 - **Review UI:** Miniflux-style uncategorized, category, feed, entry, and history views with manual labels, Done, bulk Done, and Fetch now.
-- **Feedback learning:** Manual labels and implicit done/read behavior train a small softmax classifier. Keyword rules remain hard overrides.
+- **Feedback learning:** Manual labels train a small softmax classifier with class-balanced weighting. Entries read elsewhere are not treated as opinions. Keyword rules remain hard overrides.
 - **Background sync:** The HTTP service reconciles Miniflux state, discovers new entries, rescores open items, refreshes catalogs, and flushes queued writebacks every 5 minutes. Pending Skimmer clicks are flushed to Miniflux before each reconciliation pass, so Miniflux is never treated as authoritative over newer local actions.
 - **Single read state:** Read = done. Opening an article marks it read in Miniflux and finishes it in Skimmer; marking it unread anywhere reopens it back onto its category list. Category pages, reader pagination, and the nav counters all share this one definition, so counts always match what a page shows.
 - **Safe defaults:** No writeback occurs unless explicitly enabled. With writeback enabled, automatic `ignore` decisions are marked read; other categories remain unread.
