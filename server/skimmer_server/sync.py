@@ -172,20 +172,46 @@ class BackgroundSync:
         return changed
 
     def _ensure_classifier(self) -> Classifier:
-        """Build the classifier once per process; retrain on every sync so the
-        model keeps learning from fresh overrides and read signals."""
+        """Build the classifier once per process; retrain on manual changes.
+
+        Retraining featurizes every history row, which is the process's
+        dominant memory cost — too expensive to do every 5-minute sync on a
+        small VPS (observed OOM at ~540 MB RSS on a 1 GB host). Instead:
+        retrain only when a new manual label has actually been recorded, and
+        otherwise reuse the in-memory model.
+        """
         if self.classifier is None:
             model_path = self.config.data_dir / "model.json"
             self.classifier = Classifier(
                 must_read_keywords=self.config.must_read_keywords,
                 possible_interest_keywords=self.config.possible_interest_keywords,
                 ignore_keywords=self.config.ignore_keywords,
-                history_rows=self.store.rows(),
+                history_rows=self._manual_rows(),
                 model_path=model_path,
             )
+            self._last_manual_count = len(self._manual_rows())
             return self.classifier
-        self.classifier.retrain(self.store.rows())
+
+        manual_count = len(self._manual_rows())
+        if manual_count != getattr(self, "_last_manual_count", -1):
+            self._last_manual_count = manual_count
+            self.classifier.retrain(self._manual_rows())
         return self.classifier
+
+    def _manual_rows(self) -> list[dict]:
+        """Only rows with explicit user labels are training data (and only
+        their metadata is needed — content is stripped before training)."""
+        slim = []
+        for row in self.store.rows():
+            if not row.get("manual"):
+                continue
+            row = dict(row)
+            row.pop("content", None)
+            source = row.get("source_entry")
+            if isinstance(source, dict):
+                row["source_entry"] = {k: v for k, v in source.items() if k != "content"}
+            slim.append(row)
+        return slim
 
     def _reconcile(
         self,
