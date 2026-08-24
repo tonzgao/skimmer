@@ -770,12 +770,13 @@ def _folder_rows(context: str | None, config: Config, store: StateStore) -> list
     parsed = urlparse(context)
     query = parse_qs(parsed.query)
 
+    # Miniflux convention: every folder lists oldest first.
+
     if parsed.path in {"", "/"}:
         # Pending: open entries whose label came from the algorithm.
         return sorted(
             (row for row in store.unread(limit=None) if not row.get("manual")),
             key=_published_sort_key,
-            reverse=True,
         )
 
     classification = parsed.path.removeprefix("/category/")
@@ -799,7 +800,7 @@ def _folder_rows(context: str | None, config: Config, store: StateStore) -> list
             row for row in store.rows()
             if row.get("classification") == review_category and row.get("status") != "read"
         ]
-        return sorted(rows, key=_published_sort_key, reverse=True)
+        return sorted(rows, key=_published_sort_key)
 
     if parsed.path == "/category":
         category_id = int(query.get("id", ["0"])[0])
@@ -811,7 +812,7 @@ def _folder_rows(context: str | None, config: Config, store: StateStore) -> list
                 or (row.get("source_entry") or {}).get("category", {}).get("id") == category_id
             )
         ]
-        return sorted(rows, key=_published_sort_key, reverse=True)
+        return sorted(rows, key=_published_sort_key)
 
     if parsed.path == "/feed":
         feed_id = int(query.get("id", ["0"])[0])
@@ -820,7 +821,7 @@ def _folder_rows(context: str | None, config: Config, store: StateStore) -> list
             if not row.get("done")
             and (row.get("source_entry") or {}).get("feed", {}).get("id") == feed_id
         ]
-        return sorted(rows, key=_published_sort_key, reverse=True)
+        return sorted(rows, key=_published_sort_key)
 
     return []
 
@@ -851,19 +852,20 @@ def _entry_neighbors(context: str | None, entry_id: int, config: Config, store: 
         None,
     )
     if position is not None:
-        # Reading order follows the list (newest-first): Next goes to the
-        # next entry down (older), Previous goes back up (newer).
+        # Reading order follows the list (oldest-first, Miniflux style):
+        # Next goes to the next entry down (newer), Previous goes back
+        # up (older).
         return (
             ordered[position - 1] if position > 0 else None,
             ordered[position + 1] if position + 1 < len(ordered) else None,
         )
 
     # Current item left the folder: walk its remaining members by date.
-    # Previous = nearest newer, Next = nearest older.
+    # Previous = nearest older, Next = nearest newer.
     older = [row for row in ordered if _published_sort_key(row) < current_key]
     newer = [row for row in ordered if _published_sort_key(row) > current_key]
-    previous = min(newer, key=_published_sort_key) if newer else None
-    following = max(older, key=_published_sort_key) if older else None
+    previous = max(older, key=_published_sort_key) if older else None
+    following = min(newer, key=_published_sort_key) if newer else None
     return previous, following
 
 
