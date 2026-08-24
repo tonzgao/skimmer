@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 
 from .storage import normalize_confidence, read_latest_decisions
@@ -24,6 +25,48 @@ class StateStore:
 
     def unread(self, limit: int | None = 200) -> list[dict]:
         return [row for row in self.rows() if row.get("status") != "read"][:limit] if limit is not None else [row for row in self.rows() if row.get("status") != "read"]
+
+    def compact(self) -> dict:
+        """Rewrite both logs, dropping superseded rows and article content.
+
+        The decisions log is last-write-wins on read and the training path
+        (learn.py extract_features) uses the same metadata the classifier
+        sees at serve time — title/url/author/feed/category — so stripping
+        stored article bodies is lossless for behavior. Returns counts.
+        """
+        from .storage import write_decisions
+
+        with self._lock:
+            self.refresh()
+            before = sum(1 for _ in open(self.decisions_path, encoding="utf-8")) if self.decisions_path.exists() else 0
+            rows = [self._slim(row) for row in self._cache.values()]
+            write_decisions(self.decisions_path, sorted(rows, key=self._sort_key, reverse=True))
+            self._cache = {int(row["entry_id"]): row for row in rows}
+
+            history_rows = []
+            if self.history_path.exists():
+                for line in self.history_path.read_text(encoding="utf-8").splitlines():
+                    if line.strip():
+                        try:
+                            history_rows.append(self._slim(json.loads(line)))
+                        except ValueError:
+                            continue
+                write_decisions(self.history_path, history_rows)
+
+            return {
+                "decision_rows_before": before,
+                "decision_rows_after": len(rows),
+                "history_rows_kept": len(history_rows),
+            }
+
+    @staticmethod
+    def _slim(row: dict) -> dict:
+        row = dict(row)
+        row.pop("content", None)
+        source = row.get("source_entry")
+        if isinstance(source, dict) and "content" in source:
+            row["source_entry"] = {k: v for k, v in source.items() if k != "content"}
+        return row
 
     def by_category(self, classification: str) -> list[dict]:
         # Working category: UNREAD entries with this label — same definition

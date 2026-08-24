@@ -25,10 +25,12 @@ def main() -> int:
     show_parser.add_argument("--limit", type=int, default=25)
     show_parser.add_argument("--fixture", action="store_true", help="Show the latest temporary fixture decisions.")
 
+    compact_parser = subparsers.add_parser("compact", help="Rewrite decisions.jsonl keeping only the latest row per entry and stripping stored article content.")
+
     args = parser.parse_args()
     config = Config.load()
 
-    if args.fixture:
+    if getattr(args, "fixture", False):
         config = _fixture_config(config, _fixture_data_dir())
     if args.command == "run-once":
         summary = run_once(config, limit=args.limit, fixture=args.fixture)
@@ -49,6 +51,23 @@ def main() -> int:
         path = config.decisions_path
         for row in _tail_jsonl(path, args.limit):
             print(json.dumps(row, sort_keys=True))
+        return 0
+
+    if args.command == "compact":
+        from .state import StateStore
+
+        size_before = config.decisions_path.stat().st_size if config.decisions_path.exists() else 0
+        history_before = config.history_path.stat().st_size if config.history_path.exists() else 0
+        store = StateStore(config.decisions_path, config.history_path)
+        stats = store.compact()
+        size_after = config.decisions_path.stat().st_size
+        history_after = config.history_path.stat().st_size
+        print(json.dumps({
+            **stats,
+            "decisions_size_mb": round(size_after / 1024 / 1024, 2),
+            "history_size_mb": round(history_after / 1024 / 1024, 2),
+            "freed_mb": round((size_before + history_before - size_after - history_after) / 1024 / 1024, 2),
+        }, indent=2))
         return 0
 
     return 1

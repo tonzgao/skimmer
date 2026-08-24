@@ -231,7 +231,6 @@ class BackgroundSync:
                 **(current.get("source_entry") or {}),
                 **(entry.get("_source_entry") or {}),
                 "id": entry_id,
-                "content": entry.get("content"),
                 "author": entry.get("author"),
                 "status": "unread",
                 "feed": entry.get("feed") or (current.get("source_entry") or {}).get("feed"),
@@ -343,18 +342,19 @@ class BackgroundSync:
 def _decision_fields(entry: dict) -> dict:
     feed = entry.get("feed")
     category = entry.get("category")
+    # Article content is deliberately NOT persisted: it is bulky (~40KB/row),
+    # immutable reference data, and the reader fetches it live from Miniflux.
+    # Only classification-relevant metadata is kept here.
     return {
         "entry_id": entry.get("id"),
         "title": entry.get("title"),
         "url": entry.get("url"),
         "author": entry.get("author"),
-        "content": entry.get("content"),
         "published_at": entry.get("published_at"),
         "feed": feed.get("title") if isinstance(feed, dict) else None,
         "category_source": category.get("title") if isinstance(category, dict) else None,
         "source_entry": {
             "id": entry.get("id"),
-            "content": entry.get("content"),
             "author": entry.get("author"),
             "status": entry.get("status"),
             "feed": feed,

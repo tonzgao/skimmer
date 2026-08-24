@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import base64
 import re
+import signal
+import threading
 from datetime import datetime, timedelta, timezone
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -524,7 +526,20 @@ def serve(config: Config) -> None:
     httpd.sync = BackgroundSync(config, httpd.store)
     httpd.sync.start()
     print(f"Serving Skimmer API on http://{config.host}:{config.port}", flush=True)
-    httpd.serve_forever()
+
+    def _shutdown(signum, frame) -> None:
+        # SIGTERM/SIGINT (docker stop, Ctrl-C): stop the sync worker and the
+        # HTTP loop promptly so container shutdown never hangs.
+        httpd.sync.stop()
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+    try:
+        httpd.serve_forever()
+    finally:
+        httpd.server_close()
+        httpd.sync.stop()
 
 
 def _parse_dt(value: object) -> datetime | None:
