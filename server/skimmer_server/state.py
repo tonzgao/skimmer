@@ -12,16 +12,27 @@ class StateStore:
         self.history_path = history_path
         self._lock = threading.RLock()
         self._cache: dict[int, dict] | None = None
+        self._sorted: list[dict] | None = None
 
     def refresh(self) -> None:
         with self._lock:
             self._cache = {int(row["entry_id"]): row for row in read_latest_decisions(self.decisions_path)}
+            self._sorted = None
 
     def rows(self) -> list[dict]:
         with self._lock:
             if self._cache is None:
                 self.refresh()
-            return sorted((normalize_confidence(dict(row)) for row in self._cache.values()), key=self._sort_key, reverse=True)
+            # The sorted+copied view is memoized until the cache changes;
+            # page renders call rows() several times (nav counts, folder
+            # lists), and re-sorting every row for each call adds up.
+            if self._sorted is None:
+                self._sorted = sorted(
+                    (normalize_confidence(dict(row)) for row in self._cache.values()),
+                    key=self._sort_key,
+                    reverse=True,
+                )
+            return [dict(row) for row in self._sorted]
 
     def unread(self, limit: int | None = 200) -> list[dict]:
         return [row for row in self.rows() if row.get("status") != "read"][:limit] if limit is not None else [row for row in self.rows() if row.get("status") != "read"]
@@ -92,14 +103,33 @@ class StateStore:
             if not rows:
                 return
             append_decisions(self.decisions_path, rows)
-            self.refresh()
+            # Incremental cache update: a full refresh() re-parses the whole
+            # decisions log; newest-wins means just overwriting is equivalent.
+            if self._cache is not None:
+                for row in rows:
+                    self._cache[int(row["entry_id"])] = row
+                self._sorted = None
 
     def mark_local_read(self, rows: list[dict]) -> None:
+        """Append rows and update the in-memory cache incrementally.
+
+        A full ``refresh()`` here would re-parse the entire decisions log on
+        every click (read toggle, override, done); applying the new rows to
+        the existing cache gives the same newest-wins result for O(rows
+        appended) work.
+        """
         from .storage import append_decisions
 
+        if not rows:
+            return
         with self._lock:
             append_decisions(self.decisions_path, rows)
-            self.refresh()
+            if self._cache is None:
+                self.refresh()
+                return
+            for row in rows:
+                self._cache[int(row["entry_id"])] = row
+            self._sorted = None
 
     @staticmethod
     def _sort_key(row: dict) -> str:

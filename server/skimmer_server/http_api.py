@@ -435,7 +435,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if parsed.path == "/fetch":
-                result = sync.sync_once()
+                # Don't block the request on a full sync (catalog + reconcile +
+                # fetch + classify can take many seconds against the Miniflux
+                # VPS): wake the background sync loop and redirect now.
+                sync.wake()
                 next_url = values.get("next", [None])[0] or self.headers.get("Referer") or "/"
                 self._redirect(next_url)
                 return
@@ -802,13 +805,15 @@ def _folder_rows(context: str | None, config: Config, store: StateStore) -> list
         else None
     )
     if review_category:
-        # Working category: open algorithm-labeled entries. Manual labels are
-        # explicit decisions and move to their folder/history immediately.
+        # Working category: all UNREAD entries with this label, manual or not.
+        # A manual label is an explicit decision about where the entry lives
+        # while it is still open — excluding manual rows here left them
+        # counted in the nav but invisible in every folder ("limbo"). This
+        # must match the nav counter in _page and StateStore.by_category.
         rows = [
             row for row in store.rows()
             if row.get("classification") == review_category
             and row.get("status") != "read"
-            and not row.get("manual")
         ]
         return sorted(rows, key=_published_sort_key)
 
@@ -963,6 +968,9 @@ def _item_markup(
         meta_feed = '<li><a href="#"><span class="feed-icon"></span>{}</a></li>'.format(escape(str(row.get("feed") or "Unknown feed")))
     published = _relative_time(row.get("published_at") or row.get("observed_at"))
     reading_time = _reading_time(str(source.get("content") or row.get("content") or ""))
+    if reading_time is None and row.get("word_count"):
+        # Lean-storage rows carry no body — estimate from the saved word count.
+        reading_time = f"{max(1, round(int(row['word_count']) / 265))} min read"
     if reading_time:
         published = f"{published} · {reading_time}"
     actions = ""

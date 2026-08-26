@@ -26,6 +26,7 @@ class Config:
     possible_interest_keywords: list[str]
     ignore_keywords: list[str]
     auth_password: str | None = None
+    sync_interval_seconds: int = 300
     _fixture: bool = False
 
     @property
@@ -74,6 +75,7 @@ class Config:
             possible_interest_keywords=_csv(values.get("SKIMMER_POSSIBLE_INTEREST_KEYWORDS")),
             ignore_keywords=_csv(values.get("SKIMMER_IGNORE_KEYWORDS")),
             auth_password=values.get("SKIMMER_PASSWORD") or None,
+            sync_interval_seconds=_int(values.get("SKIMMER_SYNC_INTERVAL"), 300),
         )
 
 

@@ -147,9 +147,10 @@ def archive_override(path: Path, entry_id: int) -> dict | None:
 
 
 def _update_latest_override(path: Path, entry_id: int, changes: dict) -> dict | None:
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
     latest_index = None
     latest_row = None
-    for index, line in enumerate(path.read_text(encoding="utf-8").splitlines() if path.exists() else []):
+    for index, line in enumerate(lines):
         if not line.strip():
             continue
         row = json.loads(line)
@@ -159,7 +160,6 @@ def _update_latest_override(path: Path, entry_id: int, changes: dict) -> dict | 
     if latest_row is None:
         return None
     latest_row.update(changes)
-    lines = path.read_text(encoding="utf-8").splitlines()
     lines[latest_index] = json.dumps(latest_row, sort_keys=True)
     atomic_write_jsonl(path, [json.loads(line) for line in lines])
     return latest_row

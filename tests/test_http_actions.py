@@ -32,6 +32,10 @@ class FakeSync:
     def request_status_change(self, entry_id: int, status: str) -> None:
         self.status_changes.append((entry_id, status))
 
+    def wake(self) -> None:
+        self.sync_calls += 1
+        return None
+
     def sync_once(self) -> dict:
         self.sync_calls += 1
         return {"new_entries": 0, "reconciled": 0, "write_back_count": 0}

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,12 +16,32 @@ from .storage import append_decisions, normalize_confidence
 
 REVIEW_THRESHOLD = 0.7
 
+# Bound on cached full entries (immutable content reference data).
+_ENTRY_CACHE_SIZE = 256
+
+# One quick retry for transient network blips before waiting a full interval.
+_RETRY_DELAY_SECONDS = 3.0
+_TRANSIENT_MARKERS = (
+    "errno 101", "errno 111", "network is unreachable",
+    "connection refused", "connection reset", "timed out", "timeout",
+    "max retries exceeded", "temporary failure in name resolution",
+    "name or service not known",
+)
+
+
+def _is_transient(exc: Exception) -> bool:
+    """True for network-level blips worth one immediate retry."""
+    text = str(exc).lower()
+    return any(marker in text for marker in _TRANSIENT_MARKERS)
+
 
 class BackgroundSync:
-    def __init__(self, config: Config, store: StateStore, interval_seconds: int = 300) -> None:
+    def __init__(self, config: Config, store: StateStore, interval_seconds: int | None = None) -> None:
         self.config = config
         self.store = store
-        self.interval_seconds = interval_seconds
+        self.interval_seconds = (
+            interval_seconds if interval_seconds is not None else config.sync_interval_seconds
+        )
         self.classifier: Classifier | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -31,6 +53,9 @@ class BackgroundSync:
         self.reconcile_after: str | None = self._load_reconcile_after()
         self.last_error: str | None = None
         self._catalog: dict | None = None
+        self._client: MinifluxClient | None = None
+        self._entry_cache: dict[int, dict] = {}
+        self._entry_cache_lock = threading.Lock()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -82,13 +107,38 @@ class BackgroundSync:
         return self._catalog
 
     def fetch_entry(self, entry_id: int) -> dict | None:
-        """Fetch a single entry (with content) straight from Miniflux."""
+        """Fetch a single entry (with content) straight from Miniflux.
+
+        Content is immutable reference data, so a small LRU cache lets
+        re-opening an article skip the VPS round-trip. The HTTP client is
+        reused across calls instead of building a new (TLS handshake per
+        click) MinifluxClient each time.
+        """
         if getattr(self.config, "_fixture", False):
             return None
+        key = int(entry_id)
+        with self._entry_cache_lock:
+            cached = self._entry_cache.get(key)
+            if cached is not None:
+                return cached
         try:
-            return MinifluxClient(self.config).entry(int(entry_id))
+            entry = self._shared_client().entry(key)
         except Exception:
             return None
+        with self._entry_cache_lock:
+            if len(self._entry_cache) >= _ENTRY_CACHE_SIZE:
+                # Cheap bound: drop arbitrary oldest-insertion entries.
+                for stale in list(self._entry_cache)[: len(self._entry_cache) - _ENTRY_CACHE_SIZE + 1]:
+                    self._entry_cache.pop(stale, None)
+            self._entry_cache[key] = entry
+        return entry
+
+    def _shared_client(self) -> MinifluxClient:
+        client = self._client
+        if client is None:
+            client = MinifluxClient(self.config)
+            self._client = client
+        return client
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -96,22 +146,40 @@ class BackgroundSync:
                 self.sync_once()
                 self.last_error = None
             except Exception as exc:
-                self.last_error = str(exc)
-                # Sync failures must be visible in docker logs, not just the
-                # status endpoint.
-                import traceback
-
-                print(
-                    f"SYNC ERROR: {exc}\n{traceback.format_exc()}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                # Transient network blips (Errno 101/111, timeouts) get one
+                # quick retry before we log and wait for the next interval.
+                if _is_transient(exc):
+                    time.sleep(_RETRY_DELAY_SECONDS)
+                    try:
+                        self.sync_once()
+                        self.last_error = None
+                    except Exception as retry_exc:
+                        self._log_sync_error(retry_exc)
+                    else:
+                        pass  # recovered — stay quiet
+                        self._wake.wait(self.interval_seconds)
+                        self._wake.clear()
+                        continue
+                else:
+                    self._log_sync_error(exc)
             self._wake.wait(self.interval_seconds)
             self._wake.clear()
 
+    def _log_sync_error(self, exc: Exception) -> None:
+        self.last_error = str(exc)
+        # Sync failures must be visible in docker logs, not just the
+        # status endpoint.
+        import traceback
+
+        print(
+            f"SYNC ERROR: {exc}\n{traceback.format_exc()}",
+            file=sys.stderr,
+            flush=True,
+        )
+
     def sync_once(self) -> dict:
         now = datetime.now(timezone.utc).isoformat()
-        client = MinifluxClient(self.config)
+        client = self._shared_client()
         self._refresh_catalog(client)
         # Flush our own pending status writes BEFORE reconciling. Reconcile
         # treats Miniflux as authoritative, so Miniflux must first reflect
@@ -138,7 +206,7 @@ class BackgroundSync:
         decisions are immutable. Entries that cross the review threshold leave
         the uncategorized queue.
         """
-        changed = 0
+        changed_rows = []
         observed_at = datetime.now(timezone.utc).isoformat()
         for row in self.store.rows():
             if row.get("manual") or row.get("done") or row.get("status") == "read":
@@ -158,16 +226,18 @@ class BackgroundSync:
             label, probability = classifier.model.predict(entry)
             if probability < REVIEW_THRESHOLD:
                 continue
-            updated = normalize_confidence({
+            changed_rows.append(normalize_confidence({
                 **row,
                 "classification": label,
                 "confidence": probability,
                 "reasons": [f"model predicts {label.replace('_', ' ')} ({probability:.0%})"],
                 "observed_at": observed_at,
-            })
-            append_decisions(self.config.decisions_path, [updated])
-            changed += 1
+            }))
+        # Single append + single refresh: one store re-parse per pass instead
+        # of one full decisions.jsonl read per promoted entry.
+        changed = len(changed_rows)
         if changed:
+            append_decisions(self.config.decisions_path, changed_rows)
             self.store.refresh()
         return changed
 
@@ -361,22 +431,26 @@ class BackgroundSync:
 
     def _refresh_catalog(self, client: MinifluxClient) -> None:
         categories = [{"id": row["id"], "title": row["title"]} for row in client.categories()]
+        # One feeds() call feeds both the per-category rollup and the flat
+        # feed list — a second call re-downloaded ~1500 feeds for nothing.
+        feeds = client.feeds()
         feeds_by_category: dict[int, list[dict]] = {}
-        for feed in client.feeds():
+        for feed in feeds:
             feeds_by_category.setdefault(feed.get("category", {}).get("id"), []).append(feed)
         for category in categories:
             category_feeds = feeds_by_category.get(category["id"], [])
             category["feed_count"] = len(category_feeds)
             category["entry_count"] = sum(int(feed.get("unread_count") or 0) for feed in category_feeds)
-        feed_rows = []
-        for feed in client.feeds():
-            feed_rows.append({
+        feed_rows = [
+            {
                 "id": feed["id"],
                 "title": feed["title"],
                 "site_url": feed.get("site_url"),
                 "category": feed.get("category", {}).get("title", "Uncategorized"),
                 "entry_count": int(feed.get("unread_count") or 0),
-            })
+            }
+            for feed in feeds
+        ]
         self._catalog = {"categories": categories, "feeds": feed_rows}
 
 
@@ -385,13 +459,15 @@ def _decision_fields(entry: dict) -> dict:
     category = entry.get("category")
     # Article content is deliberately NOT persisted: it is bulky (~40KB/row),
     # immutable reference data, and the reader fetches it live from Miniflux.
-    # Only classification-relevant metadata is kept here.
+    # A word count is kept so list pages can still show a reading-time
+    # estimate without the body.
     return {
         "entry_id": entry.get("id"),
         "title": entry.get("title"),
         "url": entry.get("url"),
         "author": entry.get("author"),
         "published_at": entry.get("published_at"),
+        "word_count": _word_count(str(entry.get("content") or "")),
         "feed": feed.get("title") if isinstance(feed, dict) else None,
         "category_source": category.get("title") if isinstance(category, dict) else None,
         "source_entry": {
@@ -402,6 +478,11 @@ def _decision_fields(entry: dict) -> dict:
             "category": category,
         },
     }
+
+
+def _word_count(content: str) -> int:
+    """Word count of the stripped body, for reading-time estimates."""
+    return len(re.sub(r"<[^>]+>", " ", content).split())
 
 
 def _read_state_row(entry: dict, current: dict | None, *, now: str) -> dict:
