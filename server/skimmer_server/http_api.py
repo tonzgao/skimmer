@@ -1123,7 +1123,9 @@ def _reader_html(
 {pagination}
 <article class="entry-content">{content}</article>
 {bottom_pagination}"""
-    return _page(str(decision.get("title") or "Entry"), escape(str(decision.get("title") or "Entry")), header, store=store)
+    # The reader renders its own <h1> inside entry-header; an empty
+    # page-header here keeps _page from printing the title a second time.
+    return _page(str(decision.get("title") or "Entry"), "", header, store=store)
 
 
 def _reader_pagination(previous: dict | None, following: dict | None, context: str, position: str) -> str:

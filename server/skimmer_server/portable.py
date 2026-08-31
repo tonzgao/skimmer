@@ -78,6 +78,7 @@ def summarize_from_history(model: SoftmaxModel, history_rows: list[dict]) -> dic
         "examples": model.examples,
         "trained_at": model.trained_at,
         "features_seen": len(feature_class_scores),
+        "label_distribution": {label: int(counts.get(label, 0)) for label in CLASSES},
         "top": {
             "words": top("w:"),
             "bigrams": top("b:"),
